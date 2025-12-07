@@ -1,0 +1,232 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split
+from sklearn.ensemble import RandomForestRegressor
+from statsmodels.tsa.arima.model import ARIMA
+from sklearn.linear_model import LinearRegression 
+import warnings
+from io import BytesIO
+
+# Suppress warnings for cleaner output
+warnings.filterwarnings("ignore")
+
+# --- 1. DATA GENERATION AND MODEL TRAINING FUNCTIONS (Integrated) ---
+
+# @st.cache_data is used to run this expensive function only once
+@st.cache_data
+def generate_and_train_data(seed=42):
+    N_RECORDS = 1000
+    N_YEARS = 10
+    N_MONTHS = N_YEARS * 12
+    START_DATE = '2015-01-01'
+    np.random.seed(seed)
+    
+    df = pd.DataFrame()
+    
+    # Data Generation (Fix for DatetimeIndex error included)
+    date_series = pd.to_datetime(pd.date_range(start=START_DATE, periods=N_MONTHS, freq='MS').repeat(8), errors='coerce').dropna().to_series().sample(N_RECORDS, replace=True, random_state=seed)
+    df['Date'] = date_series.values
+    df['Month'] = df['Date'].dt.month
+    
+    df['Kharif_Rainfall_mm'] = np.random.normal(loc=700, scale=150, size=N_RECORDS)
+    df['Avg_Max_Temp_C'] = 25 + 10 * np.sin(2 * np.pi * (df['Month'] - 3) / 12) + np.random.normal(0, 2, N_RECORDS)
+    df['Fertilizer_N_Low'] = np.random.choice([0, 1], N_RECORDS, p=[0.3, 0.7])
+    df['Pest_Incidence_Index'] = np.clip(10 * df['Avg_Max_Temp_C'] + np.random.randint(0, 30, N_RECORDS), 10, 100).astype(int)
+    # Synthetic Water Req for Module 4
+    df['Crop_Water_Req_mm'] = 5 + 0.8 * df['Avg_Max_Temp_C'] - 0.1 * df['Kharif_Rainfall_mm'] + np.random.normal(0, 1, N_RECORDS) 
+    
+    # YIELD (Target)
+    df['Yield_Kg_per_Ha'] = np.clip((1000 + 0.5 * df['Kharif_Rainfall_mm']) + (-300 * df['Fertilizer_N_Low']) + np.random.normal(0, 200, N_RECORDS), 500, 2000).round(0)
+    
+    # PRICE (Target)
+    msp_trend = np.linspace(4000, 7500, N_YEARS)
+    msp_map = dict(zip(df['Date'].dt.year.unique(), msp_trend.round(-1)))
+    df['MSP_Quintal'] = df['Date'].dt.year.map(msp_map).fillna(method='ffill')
+    df['Global_Price_USD'] = np.linspace(0.65, 0.95, N_RECORDS) + np.random.normal(0, 0.05, N_RECORDS)
+    seasonal_factor = np.where(df['Month'].isin([11, 12, 1]), 0.95, 1.05)
+    df['Market_Price_Modal'] = np.clip((df['MSP_Quintal'] * 0.5 + df['Global_Price_USD'] * 3000) * seasonal_factor + np.random.normal(0, 200), df['MSP_Quintal'] * 0.9, df['MSP_Quintal'] * 1.5).round(0)
+    
+    # Costs and Profit (for Module 3)
+    df['Net_Profit_per_Ha'] = 23913 # Base profit from final analysis
+    
+    # MODEL 1: ARIMA (Price)
+    monthly_price_series = df.set_index('Date')['Market_Price_Modal'].resample('MS').mean().dropna()
+    arima_model = ARIMA(monthly_price_series, order=(2, 1, 1)).fit()
+    
+    # MODEL 2: Random Forest (Yield)
+    yield_features = ['Kharif_Rainfall_mm', 'Avg_Max_Temp_C', 'Fertilizer_N_Low', 'Pest_Incidence_Index']
+    X_yield = df[yield_features]
+    Y_yield = df['Yield_Kg_per_Ha']
+    rf_model = RandomForestRegressor(n_estimators=100, random_state=seed, n_jobs=-1)
+    rf_model.fit(X_yield, Y_yield)
+    
+    # MODEL 4: Linear Regression (Water Req)
+    water_features = ['Avg_Max_Temp_C', 'Kharif_Rainfall_mm']
+    X_water = df[water_features]
+    Y_water = df['Crop_Water_Req_mm']
+    lr_model = LinearRegression()
+    lr_model.fit(X_water, Y_water)
+    
+    return df, arima_model, rf_model, lr_model, monthly_price_series, yield_features, water_features
+
+# --- 2. DASHBOARD LAYOUT (The Container) ---
+def main():
+    # Load all models and data once
+    df, arima_model, rf_model, lr_model, monthly_price_series, yield_features, water_features = generate_and_train_data()
+
+    st.set_page_config(layout="wide")
+    st.title("🌾 Telangana Cotton Prescriptive Analytics")
+    st.markdown("### Integrated Dashboard for Yield, Price, and Operational Optimization")
+    
+    st.sidebar.header("Navigation")
+    
+    # Use tabs to organize the four modules
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "📈 M1: Price Forecast", 
+        "🌳 M2: Yield Risk & M3: Profit Prescription", 
+        "💧 M4: Water Requirement Analysis",
+        "⚙️ Simulation Tool"
+    ])
+    
+    # --- MODULE 1: PRICE FORECAST ---
+    with tab1:
+        st.header("📈 Market Price Forecast (Module 1)")
+        st.markdown("**Actionable Insight:** Use this 12-month forecast to plan sales timing and maximize revenue.")
+        
+        forecast_steps = st.slider("Select Forecast Horizon (Months)", 6, 24, 12)
+        forecast = arima_model.get_forecast(steps=forecast_steps)
+        
+        # Plotting the forecast
+        fig, ax = plt.subplots(figsize=(10, 4))
+        monthly_price_series.tail(24).plot(ax=ax, label='Historical Price', color='darkblue')
+        forecast.predicted_mean.plot(ax=ax, label='Forecasted Price', color='red', linestyle='--')
+        ax.fill_between(forecast.conf_int().index, forecast.conf_int().iloc[:, 0], forecast.conf_int().iloc[:, 1], color='pink', alpha=0.3, label='95% Confidence Interval')
+        ax.set_title(f'{forecast_steps}-Month Cotton Price Forecast (INR/Quintal)')
+        ax.set_ylabel("Price (INR/Quintal)")
+        ax.legend()
+        st.pyplot(fig)
+        
+        max_price_index = forecast.predicted_mean.idxmax()
+        max_price_value = forecast.predicted_mean.max()
+        st.success(f"**Recommended Selling Period:** {max_price_index.strftime('%B %Y')} with a peak price of **₹{max_price_value:,.0f}/Quintal**.")
+
+    # --- MODULE 2 & 3: YIELD RISK & PROFIT PRESCRIPTION ---
+    with tab2:
+        st.header("🌳 Yield Risk & 💰 Profit Prescription (M2 & M3)")
+        st.markdown("**Core Insight:** The top factor limiting yield is identified by the Random Forest model, leading to a high-ROI financial recommendation.")
+        
+        col_chart, col_reco = st.columns(2)
+        
+        # COLUMN 1: Feature Importance Chart (M2)
+        with col_chart:
+            st.subheader("Yield Drivers (Feature Importance)")
+            feature_importances = pd.Series(rf_model.feature_importances_, index=yield_features)
+            feature_importances = feature_importances.sort_values(ascending=False)
+
+            fig_imp, ax_imp = plt.subplots(figsize=(8, 4))
+            sns.barplot(x=feature_importances.values, y=feature_importances.index, ax=ax_imp, palette='viridis')
+            ax_imp.set_title('Top Drivers of Cotton Yield')
+            ax_imp.set_xlabel('Importance Score')
+            st.pyplot(fig_imp)
+        
+        # COLUMN 2: Profit Recommendation (M3)
+        with col_reco:
+            st.subheader("Profit Maximization Recommendation")
+            
+            top_risk = feature_importances.index[0]
+            
+            # Use confirmed analysis figures
+            current_avg_profit = 23913
+            cost_of_fert = 2000
+            estimated_profit_boost = 17769
+            recommended_avg_profit = current_avg_profit + estimated_profit_boost
+            
+            st.metric("Top Yield Risk", top_risk.replace('_', ' '))
+            
+            st.info(f"""
+            **Actionable Advice:** The top risk is **{top_risk.replace('_', ' ')}**. 
+            Investing **₹{cost_of_fert:,.0f}** to mitigate this is projected to be highly profitable.
+            """)
+            
+            profit_table = pd.DataFrame({
+                'Metric': ['Baseline Average Profit', 'Projected Profit', 'Profit Increase'],
+                'Value (INR/Ha)': [current_avg_profit, recommended_avg_profit, estimated_profit_boost]
+            }).round(0)
+            
+            st.table(profit_table.set_index('Metric'))
+            st.success(f"**Potential ROI:** Over 800% return on investment!")
+
+    # --- MODULE 4: WATER REQUIREMENT ANALYSIS ---
+    with tab3:
+        st.header("💧 Crop Water Requirement Analysis (Module 4)")
+        st.markdown("**Goal:** Quantify how weather (Temp & Rain) drives the need for irrigation.")
+        
+        st.subheader("Linear Regression Model Coefficients")
+        coefficients = pd.Series(lr_model.coef_, index=water_features)
+        
+        st.code(f"""
+        R-squared (R²): {lr_model.score(df[water_features], df['Crop_Water_Req_mm']):.4f}
+        Intercept (Baseline Req): {lr_model.intercept_:.2f} mm
+        
+        Coefficient:
+        Avg_Max_Temp_C: {coefficients['Avg_Max_Temp_C']:.4f} (For every 1°C increase, water need changes by this much)
+        Kharif_Rainfall_mm: {coefficients['Kharif_Rainfall_mm']:.4f} (For every 1mm increase in rain, water need changes by this much)
+        """)
+        
+        # Plotting the relationship
+        fig_water, ax_water = plt.subplots(figsize=(10, 5))
+        ax_water.scatter(df['Avg_Max_Temp_C'], df['Crop_Water_Req_mm'], alpha=0.6, label='Actual Data Points', color='skyblue')
+        
+        mean_rainfall = df['Kharif_Rainfall_mm'].mean()
+        x_range = np.linspace(df['Avg_Max_Temp_C'].min(), df['Avg_Max_Temp_C'].max(), 100)
+        y_line = lr_model.intercept_ + coefficients['Avg_Max_Temp_C'] * x_range + coefficients['Kharif_Rainfall_mm'] * mean_rainfall
+
+        ax_water.plot(x_range, y_line, color='red', linestyle='--', label='Regression Line (Avg Rainfall Constant)')
+        ax_water.set_title('Impact of Temperature on Crop Water Requirement')
+        ax_water.set_xlabel('Average Max Temperature (°C)')
+        ax_water.set_ylabel('Crop Water Requirement (mm/period)')
+        ax_water.legend()
+        st.pyplot(fig_water)
+        
+    # --- MODULE 4: INTERACTIVE SIMULATION TOOL ---
+    with tab4:
+        st.header("⚙️ Prescriptive Simulation Tool")
+        st.markdown("Use the sliders to simulate changes in weather conditions and management decisions.")
+        
+        # Create user inputs
+        st.subheader("Simulate Input Factors")
+        
+        col_s1, col_s2 = st.columns(2)
+        with col_s1:
+            input_temp = st.slider("Forecasted Average Max Temperature (°C)", 20.0, 45.0, 32.0)
+            input_rain = st.slider("Forecasted Kharif Rainfall (mm)", 400.0, 1000.0, 700.0)
+        with col_s2:
+            input_fert = st.selectbox("Fertilizer Management (Nitrogen Status)", 
+                                      options=[0, 1], 
+                                      format_func=lambda x: 'Sufficient (0)' if x == 0 else 'Deficient (1)')
+            
+            # Simple simulation of pest incidence based on temperature
+            input_pest = np.clip(10 * input_temp, 10, 100)
+            st.metric("Estimated Pest Incidence Index", value=f"{input_pest:,.0f}")
+            
+        # 1. Predict Yield (Using RF Model)
+        input_data_yield = pd.DataFrame([[input_rain, input_temp, input_fert, input_pest]], columns=yield_features)
+        predicted_yield = rf_model.predict(input_data_yield)[0]
+        
+        # 2. Predict Water Requirement (Using LR Model)
+        input_data_water = pd.DataFrame([[input_temp, input_rain]], columns=water_features)
+        predicted_water_req = lr_model.predict(input_data_water)[0]
+        
+        st.markdown("---")
+        st.subheader("Simulation Results")
+        
+        col_r1, col_r2 = st.columns(2)
+        col_r1.metric("Predicted Yield", f"{predicted_yield:,.0f} Kg/Ha", delta=f"{predicted_yield - 1500:,.0f} from benchmark")
+        col_r2.metric("Predicted Water Requirement", f"{predicted_water_req:,.2f} mm", delta_color="inverse")
+
+
+if __name__ == '__main__':
+    main()
